@@ -1,62 +1,91 @@
 // app/api/gmail/route.js
 import { google } from "googleapis";
 import { db } from "@/db/index";
-import { NextApiRequest } from "next";
 import { accounts } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { auth } from "@/auth";
 
-export async function GET(req: NextApiRequest) {
-  const session = await auth();
+interface Session {
+  user?: {
+    id?: string;
+  };
+}
 
-  if (!session || !session.user?.id) {
-    return new Response(JSON.stringify({ error: "Unauthorized" }), {
-      status: 401,
-    });
-  }
+const getAccessToken = async (userId: string): Promise<string | null> => {
   const account = await db
-    .select({ access_token: accounts.access_token })
+    .select()
     .from(accounts)
-    .where(eq(accounts.userId, session.user?.id));
+    .where(eq(accounts.userId, userId));
 
-  if (!account || !account[0].access_token) {
-    return new Response(JSON.stringify({ error: "No access token found" }), {
-      status: 401,
-    });
+  if (account && account[0]?.access_token) {
+    return String(account[0].access_token);
   }
+  return null;
+};
+
+const fetchEmailMessages = async (authClient: any) => {
+  const gmail = google.gmail({ version: "v1", auth: authClient });
+  const messages = await gmail.users.messages.list({ userId: "me" });
+
+  const messageIds = messages.data.messages?.map((message: any) => message.id);
+  if (!messageIds) return [];
+
+  const limitedMessageIds = messageIds.slice(0, 10);
+
+  const emails = await Promise.all(
+    limitedMessageIds.map(async (messageId: string) => {
+      const message = await gmail.users.messages.get({
+        userId: "me",
+        id: messageId,
+      });
+      return message.data;
+    })
+  );
+
+  return emails;
+};
+
+const parseEmailData = (emails: any[]) => {
+  return emails
+    .map((email) => {
+      if (!email) return null;
+      const snippet = email.snippet;
+      const bodyData =
+        email.payload?.parts?.map((part: any) => part.body?.data) || [];
+      const decodedBodyData = bodyData[0]
+        ? Buffer.from(bodyData[0], "base64").toString("ascii")
+        : "";
+
+      return {
+        snippet,
+        emailData: decodedBodyData,
+      };
+    })
+    .filter(Boolean);
+};
+
+export async function GET() {
   try {
-    const accessToken = String(account[0].access_token); // Ensure access token is a string
+    const session: Session | null = await auth();
+
+    if (!session || !session.user?.id) {
+      return new Response("Unauthorized");
+    }
+
+    const accessToken = await getAccessToken(session.user.id);
+
+    if (!accessToken) {
+      return new Response("No access token found");
+    }
+
     const authClient = new google.auth.OAuth2();
     authClient.setCredentials({ access_token: accessToken });
-    const gmail = google.gmail({ version: "v1", auth: authClient });
-    // List user's messages (emails)
-    const messages = await gmail.users.messages.list({
-      userId: "me",
-    });
 
-    // Extract message IDs
-    const messageIds = messages.data.messages?.map(
-      (message: any) => message.id
-    );
+    const emails = await fetchEmailMessages(authClient);
+    const emailDataArray = parseEmailData(emails);
 
-    if (!messageIds) return;
-    // Retrieve email content for each message
-    const emails = await Promise.all(
-      messageIds.map(async (messageId: string, i) => {
-        if (i > 10) return;
-        const message = await gmail.users.messages.get({
-          userId: "me",
-          id: messageId,
-        });
-        i++;
-        return message.data;
-      })
-    );
-
-    var data = emails[0];
-    return new Response(JSON.stringify({ data }));
+    return new Response(JSON.stringify(emailDataArray));
   } catch (error) {
-    console.error("Error fetching user emails:", error);
-    return new Response(JSON.stringify(error));
+    return new Response("Internal Server Error");
   }
 }
